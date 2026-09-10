@@ -4,6 +4,8 @@ import time
 import pandas as pd
 import unicodedata
 from playwright.sync_api import sync_playwright
+import os
+os.system("playwright install chromium")
 
 # অ্যাপের কনফিগারেশন
 st.set_page_config(page_title="ভূমি রেকর্ড অনুসন্ধান", page_icon="🗺️", layout="wide")
