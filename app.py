@@ -1,10 +1,12 @@
 import streamlit as st
 import requests
 import time
+import os
 import pandas as pd
 import unicodedata
 from playwright.sync_api import sync_playwright
-import os
+
+# ক্লাউড সার্ভারে Playwright-এর জন্য ক্রোমিয়াম ব্রাউজার ইন্সটল করার কমান্ড
 os.system("playwright install chromium")
 
 # অ্যাপের কনফিগারেশন
@@ -18,6 +20,8 @@ if 'is_logged_in' not in st.session_state:
     st.session_state.is_logged_in = False
 if 'user_token' not in st.session_state:
     st.session_state.user_token = ""
+if 'public_token' not in st.session_state:
+    st.session_state.public_token = ""
 if 'search_results' not in st.session_state:
     st.session_state.search_results = []
 if 'survey_key_used' not in st.session_state:
@@ -35,138 +39,134 @@ def clean_text(text):
     return text.strip()
 
 
-# --- আপনার ক্যাপচার করা অরিজিনাল পাবলিক হেডার ---
-PUBLIC_API_TOKEN = "Bearer iynoeZ9E7B7Uv3Qa9LZicvPdQhLAnNKO"
-
-
-def get_public_headers():
-    return {
-        'Accept': 'application/json',
-        'Authorization': PUBLIC_API_TOKEN,
-        'Referer': 'https://dlrms.land.gov.bd/',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-
-
-# --- পাব্লিক এপিআই ফেচ করার ফাংশন (Playwright ছাড়াই সুপারফাস্ট রান করবে) ---
-@st.cache_data(ttl=3600)
-def fetch_public_data(url):
-    try:
-        res = requests.get(url, headers=get_public_headers(), timeout=10)
-        if res.status_code == 200:
-            return res.json().get('data', [])
-    except Exception:
-        pass
-    return []
-
-
-# --- Playwright দিয়ে SSO লগইন ও সেশন টোকেন এক্সট্রাকশন (Stealth & Selector Verified) ---
-def login_and_get_token(phone, password):
+# --- Playwright দিয়ে SSO লগইন এবং Public ও User Token এক্সট্রাকশন ---
+def login_and_get_tokens(phone, password):
     phone = phone.strip()
     if phone.startswith("0"):
         phone = phone[1:]
 
+    captured_public_token = None
+
+    # নেটওয়ার্ক রিকোয়েস্ট ইন্টারসেপ্ট করার গুপ্তচর ফাংশন
+    def handle_request(request):
+        nonlocal captured_public_token
+        # যখনই ব্রাউজার public api তে কল করবে, আমরা authorization হেডারটি ধরে ফেলব
+        if "/core-api/api/public" in request.url:
+            auth_header = request.headers.get("authorization")
+            if auth_header and "Bearer" in auth_header and not captured_public_token:
+                captured_public_token = auth_header
+
     try:
         with sync_playwright() as p:
-            # আসল ব্রাউজারের মতো আচরণ করানোর জন্য বিশেষ আর্গুমেন্ট
             browser = p.chromium.launch(
                 headless=True,
                 args=[
                     '--disable-blink-features=AutomationControlled',
                     '--no-sandbox',
-                    '--disable-setuid-sandbox'
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage'
                 ]
             )
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
                 viewport={'width': 1280, 'height': 720}
             )
-            context.set_default_timeout(60000)
+            context.set_default_timeout(45000)
             page = context.new_page()
 
-            # ১. লগইন পেজে যাওয়া
-            page.goto("https://lsg-land-owner.land.gov.bd/login", wait_until="networkidle")
+            # ব্রাউজারে নেটওয়ার্ক লিসেনার চালু করা হলো
+            page.on("request", handle_request)
 
-            # ২. ইনপুট বক্স স্ক্রিনে আসা পর্যন্ত নিশ্চিতভাবে অপেক্ষা করা
-            username_selector = 'input[name="username"]'
-            page.wait_for_selector(username_selector, state="visible", timeout=30000)
+            try:
+                # ১. লগইন পেজ
+                page.goto("https://lsg-land-owner.land.gov.bd/login", wait_until="commit")
+                page.wait_for_selector('input[name="username"]', state="visible", timeout=20000)
 
-            # ৩. ফর্ম ইনপুট
-            page.fill(username_selector, phone)
-            page.fill('input[name="password"]', password)
+                # ২. ইনপুট
+                page.fill('input[name="username"]', phone)
+                page.fill('input[name="password"]', password)
 
-            # ৪. অটো-ক্যাপচা সলভ
-            page.evaluate('''
-                          let captchaLabel = document.getElementById("mainCaptcha");
-                          let captchaInput = document.getElementById("txtInput");
-                          if (captchaLabel && captchaInput) {
-                              let code = captchaLabel.innerText || captchaLabel.value;
-                              captchaInput.value = code.trim();
-                              captchaInput.dispatchEvent(new Event('input', {bubbles: true}));
-                              captchaInput.dispatchEvent(new Event('change', {bubbles: true}));
-                          }
-                          ''')
+                # ৩. ক্যাপচা সলভ
+                page.evaluate('''
+                              let captchaLabel = document.getElementById("mainCaptcha");
+                              let captchaInput = document.getElementById("txtInput");
+                              if (captchaLabel && captchaInput) {
+                                  captchaInput.value = (captchaLabel.innerText || captchaLabel.value).trim();
+                                  captchaInput.dispatchEvent(new Event('input', {bubbles: true}));
+                                  captchaInput.dispatchEvent(new Event('change', {bubbles: true}));
+                              }
+                              ''')
 
-            # ৫. সাবমিট
-            page.click('button[type="submit"]')
-            page.wait_for_timeout(4000)
+                # ৪. সাবমিট
+                page.click('button[type="submit"]')
+                page.wait_for_timeout(4000)
 
-            if "login" in page.url:
+                if "login" in page.url:
+                    page.screenshot(path="debug_error.png")
+                    return False, "লগইন ফেইলড! পাসওয়ার্ড ভুল বা সার্ভার এরর।", None
+
+                # ৫. SSO রিডাইরেক্ট
+                page.goto("https://dlrms.land.gov.bd/citizen/sso-login", wait_until="commit")
+                page.wait_for_timeout(3000)
+
+                # ৬. মূল ড্যাশবোর্ড (এখানেই public api কল হয় এবং আমাদের লিসেনার টোকেন ধরে ফেলে)
+                page.goto("https://dlrms.land.gov.bd/", wait_until="commit")
+                page.wait_for_timeout(4000)
+
+                # ৭. User Token খোঁজা
+                user_jwt_token = page.evaluate('''
+                                               () => {
+                                                   return localStorage.getItem('auth_access_token') ||
+                                                       sessionStorage.getItem('auth_access_token') ||
+                                                       (window.__NEXT_DATA__ && window.__NEXT_DATA__.props.pageProps.tokenStatus.token) ||
+                                                       null;
+                                               }
+                                               ''')
+
+                if not user_jwt_token:
+                    for cookie in context.cookies():
+                        if cookie['name'] in ['auth_access_token', 'dlrms_app_token']:
+                            user_jwt_token = cookie['value']
+                            break
+
                 browser.close()
-                return False, "লগইন ফেইলড! পাসওয়ার্ড ভুল অথবা ক্যাপচা ভেরিফিকেশন ফেইল।"
 
-            # ৬. SSO রিডাইরেক্ট সম্পূর্ণ করা
-            page.goto("https://dlrms.land.gov.bd/citizen/sso-login", wait_until="domcontentloaded")
-            page.wait_for_timeout(3000)
+                if user_jwt_token:
+                    if not user_jwt_token.startswith("Bearer "):
+                        user_jwt_token = f"Bearer {user_jwt_token}"
+                    return True, user_jwt_token, captured_public_token
+                else:
+                    page.screenshot(path="debug_error.png")
+                    return False, "লগইন হয়েছে কিন্তু User টোকেন পাওয়া যায়নি।", None
 
-            # ৭. মূল ড্যাশবোর্ডে যাওয়া
-            page.goto("https://dlrms.land.gov.bd/", wait_until="domcontentloaded")
-            page.wait_for_timeout(3000)
-
-            jwt_token = None
-
-            # ৮. চেক ১: কুকিজ থেকে টোকেন বের করা
-            cookies = context.cookies()
-            for cookie in cookies:
-                if cookie['name'] in ['auth_access_token', 'token', 'dlrms_app_token']:
-                    jwt_token = cookie['value']
-                    break
-
-            # ৯. চেক ২: LocalStorage & SessionStorage চেক করা
-            if not jwt_token:
-                jwt_token = page.evaluate('''
-                                          () => {
-                                              return localStorage.getItem('auth_access_token') ||
-                                                  localStorage.getItem('token') ||
-                                                  sessionStorage.getItem('auth_access_token') ||
-                                                  sessionStorage.getItem('token') ||
-                                                  null;
-                                          }
-                                          ''')
-
-            # ১০. চেক ৩: __NEXT_DATA__ পেজ স্টেট থেকে চেক করা
-            if not jwt_token:
-                jwt_token = page.evaluate('''
-                                          () => {
-                                              try {
-                                                  return window.__NEXT_DATA__.props.pageProps.tokenStatus.token || null;
-                                              } catch (e) {
-                                                  return null;
-                                              }
-                                          }
-                                          ''')
-
-            browser.close()
-
-            if jwt_token:
-                if not jwt_token.startswith("Bearer "):
-                    jwt_token = f"Bearer {jwt_token}"
-                return True, jwt_token
-            else:
-                return False, "লগইন হয়েছে কিন্তু স্টোরেজে কোনো টোকেন পাওয়া যায়নি।"
+            except Exception as inner_e:
+                page.screenshot(path="debug_error.png")
+                browser.close()
+                return False, f"ভেতরের এরর: {str(inner_e)}", None
 
     except Exception as e:
-        return False, f"এরর: {str(e)}"
+        return False, f"ব্রাউজার এরর: {str(e)}", None
+
+
+# --- ডাইনামিক হেডার ফাংশন ---
+def get_public_headers():
+    return {
+        'Accept': 'application/json',
+        'Authorization': st.session_state.public_token,
+        'Referer': 'https://dlrms.land.gov.bd/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+
+
+def get_auth_headers():
+    return {
+        'Accept': 'application/json',
+        'Authorization': st.session_state.public_token,
+        'User-Token': st.session_state.user_token,
+        'Referer': 'https://dlrms.land.gov.bd/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+
 
 # --- সাইডবার লগইন ---
 st.sidebar.header("🔐 সিস্টেমে লগইন করুন")
@@ -179,22 +179,33 @@ if not st.session_state.is_logged_in:
         if not phone_input or not pass_input:
             st.sidebar.warning("দয়া করে ফোন নম্বর এবং পাসওয়ার্ড দিন!")
         else:
-            with st.spinner("লগইন হচ্ছে এবং সেশন ভেরিফাই করা হচ্ছে..."):
-                success, result = login_and_get_token(phone_input, pass_input)
+            if os.path.exists("debug_error.png"):
+                os.remove("debug_error.png")
+
+            with st.spinner("লগইন হচ্ছে এবং ডাইনামিক টোকেন স্ক্যান করা হচ্ছে..."):
+                success, user_token, public_token = login_and_get_tokens(phone_input, pass_input)
 
                 if success:
                     st.session_state.is_logged_in = True
-                    st.session_state.user_token = result
-                    st.sidebar.success("✅ সফলভাবে লগইন হয়েছে!")
+                    st.session_state.user_token = user_token
+
+                    # যদি কোনো কারণে গুপ্তচর টোকেন না পায়, তবে ফলব্যাক হিসেবে আপনার দেওয়া টোকেনটি ব্যবহার করবে
+                    st.session_state.public_token = public_token if public_token else "Bearer nuOYIjN0wzFmchpKokAMNzR8ppsA2Iw7"
+
+                    st.sidebar.success("✅ সফলভাবে লগইন ও টোকেন ক্যাপচার হয়েছে!")
                     time.sleep(1)
                     st.rerun()
                 else:
-                    st.sidebar.error(f"{result}")
+                    st.sidebar.error(f"❌ {user_token}")
+                    if os.path.exists("debug_error.png"):
+                        st.sidebar.markdown("### 📸 ব্রাউজারে আটকে যাওয়ার দৃশ্য:")
+                        st.sidebar.image("debug_error.png", caption="এখানেই সমস্যাটি হয়েছে!")
 else:
     st.sidebar.success("✅ আপনি সিস্টেমে লগইন অবস্থায় আছেন!")
     if st.sidebar.button("লগআউট 🚪"):
         st.session_state.is_logged_in = False
         st.session_state.user_token = ""
+        st.session_state.public_token = ""
         st.session_state.search_results = []
         st.cache_data.clear()
         st.rerun()
@@ -210,12 +221,28 @@ if st.session_state.is_logged_in:
         st.cache_data.clear()
         st.rerun()
 
-    # ১. বিভাগ লোড
-    divisions_data = fetch_public_data("https://gateway.dlrms.land.gov.bd/core-api/api/public/divisions?ROW_STATUS=1")
-    districts_data = fetch_public_data("https://gateway.dlrms.land.gov.bd/core-api/api/public/districts?ROW_STATUS=1")
-    upazilas_data = fetch_public_data("https://gateway.dlrms.land.gov.bd/core-api/api/public/upazilas?ROW_STATUS=1")
+
+    # পাব্লিক এপিআই ফেচ করার ফাংশন
+    @st.cache_data(ttl=3600)
+    def fetch_public_data(url, current_public_token):
+        try:
+            res = requests.get(url, headers=get_public_headers(), timeout=10)
+            if res.status_code == 200:
+                return res.json().get('data', [])
+        except Exception:
+            pass
+        return []
+
+
+    # ১. বিভাগ লোড (টোকেন আর্গুমেন্ট হিসেবে পাস করা হলো যাতে টোকেন চেঞ্জ হলে ক্যাশ আপডেট হয়)
+    divisions_data = fetch_public_data("https://gateway.dlrms.land.gov.bd/core-api/api/public/divisions?ROW_STATUS=1",
+                                       st.session_state.public_token)
+    districts_data = fetch_public_data("https://gateway.dlrms.land.gov.bd/core-api/api/public/districts?ROW_STATUS=1",
+                                       st.session_state.public_token)
+    upazilas_data = fetch_public_data("https://gateway.dlrms.land.gov.bd/core-api/api/public/upazilas?ROW_STATUS=1",
+                                      st.session_state.public_token)
     global_surveys_data = fetch_public_data(
-        "https://gateway.dlrms.land.gov.bd/core-api/api/public/surveys?ROW_STATUS=1")
+        "https://gateway.dlrms.land.gov.bd/core-api/api/public/surveys?ROW_STATUS=1", st.session_state.public_token)
 
     search_type = st.sidebar.radio(
         "খতিয়ানের ধরন নির্বাচন করুন:",
@@ -242,7 +269,7 @@ if st.session_state.is_logged_in:
 
     if search_type == "সার্ভে খতিয়ান (Survey)" and selected_dist_code and selected_upz_code:
         survey_api_url = f"https://gateway.dlrms.land.gov.bd/core-api/api/public/upazilas/surveys?DISTRICT_BBS_CODE={selected_dist_code}&UPAZILA_BBS_CODE={selected_upz_code}"
-        available_surveys = fetch_public_data(survey_api_url)
+        available_surveys = fetch_public_data(survey_api_url, st.session_state.public_token)
 
         if available_surveys:
             survey_dict = {s['LOCAL_NAME']: s['SURVEY_ID'] for s in available_surveys}
@@ -253,17 +280,6 @@ if st.session_state.is_logged_in:
             st.sidebar.warning("এই উপজেলায় কোনো সার্ভে পাওয়া যায়নি!")
 
     target_keyword = st.sidebar.text_input("যার নাম খুঁজছেন", value="")
-
-
-    # অথেনটিকেটেড হেডারে রিকোয়েস্ট
-    def get_auth_headers():
-        return {
-            'Accept': 'application/json',
-            'Authorization': PUBLIC_API_TOKEN,
-            'User-Token': st.session_state.user_token,
-            'Referer': 'https://dlrms.land.gov.bd/',
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-        }
 
 
     def search_khatians(survey_key, mouza_id, mouza_name, target_name):
@@ -332,7 +348,7 @@ if st.session_state.is_logged_in:
             if not is_mutation and selected_survey_id:
                 mouza_url += f"&SURVEY_ID={selected_survey_id}"
 
-            mouzas = fetch_public_data(mouza_url)
+            mouzas = fetch_public_data(mouza_url, st.session_state.public_token)
             total_mouzas = len(mouzas)
             all_results = []
 
